@@ -19,6 +19,19 @@ def get_db_connection():
 def home():
     return render_template("index.html")
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+@app.route("/ready")
+def ready():
+    try:
+        db = get_db_connection()
+        db.close()
+        return jsonify({"status": "ready"}), 200
+    except Exception as e:
+        return jsonify({"status": "not ready", "error": str(e)}), 503
+
 @app.route("/expenses", methods=["GET"])
 def get_expenses():
     db = get_db_connection()
