@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-expense-tracker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloud-expense-tracker
+  template:
+    metadata:
+      labels:
+        app: cloud-expense-tracker
+    spec:
+      containers:
+      - name: cloud-expense-tracker
+        image: cloud-expense-tracker:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 5000
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
