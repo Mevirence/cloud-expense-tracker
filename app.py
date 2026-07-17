@@ -1,7 +1,9 @@
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, json, jsonify, request, render_template
 import mysql.connector
 import boto3
 import os
+import time
+import threading
 from datetime import datetime, date as date_cls, timezone
 from decimal import Decimal
 from dotenv import load_dotenv
@@ -30,29 +32,47 @@ dynamodb = boto3.resource(
 DYNAMO_TABLE = os.getenv("DYNAMODB_TABLE_NAME", "multicloud-lab-instance")
 
 # AWS S3 client
+# Added in
+s3_endpoint_override = os.getenv("AWS_S3_ENDPOINT_OVERRIDE")
 s3 = boto3.client(
     "s3",
-    region_name=os.getenv("AWS_REGION", "ap-southeast-1")
+    region_name=os.getenv("AWS_REGION", "ap-southeast-1"),
+    endpoint_url=s3_endpoint_override if s3_endpoint_override else None
 )
 S3_BUCKET = os.getenv("AWS_S3_BUCKET_NAME")
 
-def log_event_to_dynamodb(event_type, expense):
-    """Write an activity/audit record to LocalStack. Never breaks the main flow"""
-    try:
-        table = dynamodb.Table(DYNAMO_TABLE)
-        table.put_item(Item={
-            "id": f"{expense['id']}-{event_type}",
-            "event_type": event_type,
-            "expense_id": expense['id'],
-            "title": expense['title'],
-            "amount": Decimal(str(expense['amount'])),
-            "category": expense['category'],
-            "date": str(expense['date']),
-            "logged_at": datetime.now(timezone.utc).isoformat()
-        })
-    except Exception as e:
-        # LocalStack being down shouuldn't take the app down with it
-        app.logger.warning(f"DynamoDB event log failed: {e}")
+event_stats = {"dynamodb_success": 0, "dynamodb_failed": 0}
+event_stats_lock = threading.Lock()
+
+def log_event_to_dynamodb(event_type, expense, max_retries=3):
+    """Write an activity/audit record to LocalStack with retry/backoff. Never breaks the main flow, failures are tracked, not raised"""
+    table = dynamodb.Table(DYNAMO_TABLE)
+    delay = 0.5  # initial delay in seconds
+    for attempt in range(1, max_retries + 1):
+        try:
+            table = dynamodb.Table(DYNAMO_TABLE)
+            table.put_item(Item={
+                "id": f"{expense['id']}-{event_type}",
+                "event_type": event_type,
+                "expense_id": expense['id'],
+                "title": expense['title'],
+                "amount": Decimal(str(expense['amount'])),
+                "category": expense['category'],
+                "date": str(expense['date']),
+                "logged_at": datetime.now(timezone.utc).isoformat()
+            })
+            with event_stats_lock:
+                event_stats["dynamodb_success"] += 1
+            return True
+        except Exception as e:
+            # LocalStack being down shouuldn't take the app down with it
+            app.logger.warning(f"DynamoDB event log failed: {e}")
+            if attempt < max_retries:
+               time.sleep(delay)
+               delay *= 2
+    with event_stats_lock:
+        event_stats["dynamodb_failed"] += 1
+    return False
 
 @app.route("/")
 def home():
@@ -111,7 +131,7 @@ def add_expense():
     return jsonify(result), 201
 
 # export/backup route
-@app.route("/expense/export", methods=["POST"])
+@app.route("/expenses/export", methods=["POST"])
 def export_expenses():
     if not S3_BUCKET:
         return jsonify({"error": "AWS_S3_BUCKET_NAME not configured"}), 500
@@ -130,13 +150,13 @@ def export_expenses():
             row['amount'] = float(row['amount'])
     
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    key = f"exports/expenses={timestamp}.json"
+    key = f"exports/expenses-{timestamp}.json"
 
     try:
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=key,
-            Body=jsonify(results, indent=2),
+            Body=json.dumps(results, indent=2),
             ContentType="application/json"
         )
     except Exception as e:
@@ -147,6 +167,31 @@ def export_expenses():
         "s3_bucket": S3_BUCKET,
         "s3_key": key,
     }), 200
+
+@app.route("/status/multicloud", methods=["GET"])
+def multicloud_status():
+    status = {"aws": {}, "localstack": {}, "event_stats": {}}
+
+    # Check real AWS reachability
+    try:
+        start = time.time()
+        s3.head_bucket(Bucket=S3_BUCKET)
+        status["aws"] = {"reachable": True, "latency_ms": round((time.time() - start) * 1000, 1)}
+    except Exception as e:
+        status["aws"] = {"reachable": False, "error": str(e)}
+
+    # Check LocalStack reachability
+    try:
+        start = time.time()
+        dynamodb.meta.client.describe_table(TableName=DYNAMO_TABLE)
+        status["localstack"] = {"reachable": True, "latency_ms": round((time.time() - start) * 1000, 1)}
+    except Exception as e:
+        status["localstack"] = {"reachable": False, "error": str(e)}
+
+    with event_stats_lock:
+        status["event_stats"] = dict(event_stats)
+
+    return jsonify(status), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
